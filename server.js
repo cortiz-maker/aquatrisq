@@ -66,52 +66,83 @@ function checkDispatchTrack(req, res, next) {
 }
 
 // ── Headers hacia DispatchTrack ──────────────────────────────
-// OJO: el formato exacto (Token / Bearer / header propio) se
-// confirma con la doc de tu cuenta. Dejo "Token" como en Quantrex.
+// La doc del API exige X-AUTH-TOKEN (tu API key) + Content-Type JSON.
 function dtHeaders() {
   return {
     "Content-Type": "application/json",
-    Authorization: `Token ${DT_API_KEY}`,
+    "X-AUTH-TOKEN": DT_API_KEY,
   };
 }
 
-// ── POST /api/dispatches — crear pedido en DispatchTrack ─────
-// El formulario React llama aquí al confirmar un pedido.
-// Body esperado: { pedido: { ...campos del pedido Aquatrisq } }
+// Dirección de origen de los despachos (bodega Aquatrisq).
+// pickup_address.name es obligatorio en Create Dispatch.
+const DT_PICKUP_NAME = process.env.DT_PICKUP_NAME || "Bodega Aquatrisq";
+
+// ── POST /api/dispatches — crear despacho en DispatchTrack ──
+// El formulario llama aquí al confirmar. Body: { pedido: {...}, items: [...] }
+// El puente enriquece con cliente + domicilio desde Supabase y arma el
+// payload de Create Dispatch (POST /api/external/v1/dispatches).
 app.post("/api/dispatches", checkPuenteToken, checkDispatchTrack, async (req, res) => {
-  const { pedido } = req.body;
-  if (!pedido) return res.status(400).json({ error: "Se requiere el campo 'pedido'." });
+  const { pedido, items } = req.body;
+  if (!pedido || !pedido.numero_guia) {
+    return res.status(400).json({ error: "Se requiere 'pedido' con numero_guia." });
+  }
 
-  // ──────────────────────────────────────────────────────────
-  // TODO (pendiente de la doc de DispatchTrack):
-  // Mapear 'pedido' al payload de Create Dispatch. Borrador según
-  // el análisis del Excel Cliente_ID — AJUSTAR con la doc real:
-  //
-  // const payload = {
-  //   identifier:     pedido.numero_guia,        // tu AQ-00001 / Nº guía
-  //   contact_id:     pedido.cliente_id,
-  //   contact_name:   pedido.contacto_nombre,
-  //   contact_phone:  pedido.telefono,
-  //   contact_email:  pedido.email,
-  //   address:        pedido.direccion,
-  //   latitude:       pedido.latitud,
-  //   longitude:      pedido.longitud,
-  //   min_delivery_time: pedido.fecha_min,
-  //   max_delivery_time: pedido.fecha_max,
-  //   items: pedido.items,                        // [{ name, quantity, code, price }]
-  //   tags:  [pedido.ruta, pedido.tipo_pago],     // TrisQ/Positive/AguaFine, factura/boleta
-  // };
-  //
-  // const { data } = await axios.post(
-  //   `${DT_API_URL}/dispatches`, payload, { headers: dtHeaders() }
-  // );
-  // return res.json({ ok: true, dispatchtrack: data });
-  // ──────────────────────────────────────────────────────────
+  try {
+    // 1) Enriquecer con cliente y domicilio (el puente usa el service key).
+    let cliente = null, domicilio = null;
+    if (supabase) {
+      if (pedido.cliente_id) {
+        const { data } = await supabase.from("clientes").select("*").eq("id", pedido.cliente_id).single();
+        cliente = data || null;
+      }
+      if (pedido.domicilio_id) {
+        const { data } = await supabase.from("domicilios").select("*").eq("id", pedido.domicilio_id).single();
+        domicilio = data || null;
+      }
+    }
 
-  return res.status(501).json({
-    error: "Mapeo DispatchTrack pendiente de la documentación del API.",
-    recibido: pedido,
-  });
+    // 2) Armar el payload de Create Dispatch.
+    const direccion = domicilio
+      ? [domicilio.direccion, domicilio.comuna].filter(Boolean).join(", ")
+      : "";
+    const lineas = Array.isArray(items) ? items : [];
+
+    const payload = {
+      identifier: pedido.numero_guia, // obligatorio (tu AQ-)
+      contact_name: cliente ? cliente.nombre : (domicilio?.etiqueta || ""),
+      contact_address: direccion,
+      contact_phone: cliente?.telefono || "",
+      contact_id: cliente?.rut || "",
+      contact_identifier: domicilio?.identificador_dt || "",
+      contact_email: cliente?.email || "",
+      latitude: domicilio?.latitud ?? null,
+      longitude: domicilio?.longitud ?? null,
+      min_delivery_time: pedido.fecha_min_entrega || null,
+      max_delivery_time: pedido.fecha_max_entrega || null,
+      to_be_payed: !!pedido.por_cobrar,
+      pickup_address: { name: DT_PICKUP_NAME }, // obligatorio
+      items: lineas.map((l) => ({
+        name: l.nombre,
+        code: l.codigo || "",
+        unit_price: String(l.precio_unit ?? 0),
+        quantity: String(l.cantidad ?? 1),
+      })),
+      tags: [
+        pedido.marca ? { name: "Ruta", value: pedido.marca } : null,
+        pedido.creado_por ? { name: "Operador", value: pedido.creado_por } : null,
+        { name: "Documento", value: pedido.tipo_documento || "" },
+      ].filter(Boolean),
+    };
+
+    // 3) Crear en DispatchTrack.
+    const r = await axios.post(`${DT_API_URL}/dispatches`, payload, { headers: dtHeaders() });
+    return res.json({ ok: true, dispatchtrack: r.data });
+  } catch (err) {
+    const detalle = err?.response?.data || err.message;
+    console.error("Error creando dispatch:", JSON.stringify(detalle));
+    return res.status(502).json({ error: "DispatchTrack rechazó el despacho.", detalle });
+  }
 });
 
 // ── POST /api/webhooks/dispatchtrack — entrega completada ────
