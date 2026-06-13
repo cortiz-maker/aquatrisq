@@ -113,8 +113,8 @@ app.post("/api/dispatches", checkPuenteToken, checkDispatchTrack, async (req, re
       contact_name: cliente ? cliente.nombre : (domicilio?.etiqueta || ""),
       contact_address: direccion,
       contact_phone: cliente?.telefono || "",
-      contact_id: cliente?.rut || "",
-      contact_identifier: domicilio?.identificador_dt || "",
+      contact_id: domicilio?.identificador_dt || "",          // enlaza el histórico del contacto en DispatchTrack (215-1)
+      contact_identifier: domicilio?.identificador_dt || "",  // mismo valor por compatibilidad
       contact_email: cliente?.email || "",
       latitude: domicilio?.latitud ?? null,
       longitude: domicilio?.longitud ?? null,
