@@ -129,9 +129,16 @@ app.post("/api/dispatches", checkPuenteToken, checkDispatchTrack, async (req, re
         quantity: String(l.cantidad ?? 1),
       })),
       tags: [
-        pedido.marca ? { name: "Ruta", value: pedido.marca } : null,
-        pedido.creado_por ? { name: "Operador", value: pedido.creado_por } : null,
-        { name: "Documento", value: pedido.tipo_documento || "" },
+        // Campos personalizados de DispatchTrack (mismos nombres que en tu cuenta).
+        pedido.marca ? { name: "Ruta", value: pedido.marca, type: "string" } : null,
+        pedido.tipo_documento === "factura" && pedido.rut_factura
+          ? { name: "Rut_Factura", value: pedido.rut_factura, type: "string" }
+          : null,
+        pedido.tipo_pago ? { name: "Tipo de Pago", value: pedido.tipo_pago, type: "string" } : null,
+        pedido.observacion ? { name: "Observacion Adicional", value: pedido.observacion, type: "string" } : null,
+        pedido.nro_jumpseller ? { name: "N° pedido Jumpsellet", value: pedido.nro_jumpseller, type: "string" } : null,
+        // N° Boleta y Chofer se completan después (facturación / asignación de ruta),
+        // por eso no se envían al crear.
       ].filter(Boolean),
     };
 
