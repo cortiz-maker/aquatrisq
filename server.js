@@ -125,7 +125,7 @@ app.post("/api/dispatches", checkPuenteToken, checkDispatchTrack, async (req, re
       items: lineas.map((l) => ({
         name: l.nombre,
         code: l.codigo || "",
-        unit_price: String(l.precio_unit ?? 0),
+        unit_price: String(Math.round((l.cantidad ?? 1) * (l.precio_unit ?? 0))),
         quantity: String(l.cantidad ?? 1),
       })),
       tags: [
