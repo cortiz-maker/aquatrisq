@@ -136,9 +136,8 @@ app.post("/api/dispatches", checkPuenteToken, checkDispatchTrack, async (req, re
           : null,
         pedido.tipo_pago ? { name: "Tipo de Pago", value: pedido.tipo_pago, type: "string" } : null,
         pedido.observacion ? { name: "Observacion Adicional", value: pedido.observacion, type: "string" } : null,
-        pedido.nro_jumpseller ? { name: "N° pedido Jumpsellet", value: pedido.nro_jumpseller, type: "string" } : null,
-        // N° Boleta y Chofer se completan después (facturación / asignación de ruta),
-        // por eso no se envían al crear.
+        pedido.nro_jumpseller ? { name: "N° DTE", value: pedido.nro_jumpseller, type: "string" } : null,
+        pedido.creado_por ? { name: "Chofer", value: pedido.creado_por, type: "string" } : null,
       ].filter(Boolean),
     };
 
