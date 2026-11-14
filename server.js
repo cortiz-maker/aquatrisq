@@ -78,6 +78,88 @@ function dtHeaders() {
 // pickup_address.name es obligatorio en Create Dispatch.
 const DT_PICKUP_NAME = process.env.DT_PICKUP_NAME || "Bodega Aquatrisq";
 
+// ── Ruta automática (14-11-2026) ─────────────────────────────
+// Pedidos asignados a un chofer de esta lista quedan solos en la ruta del día
+// de su vehículo: si ya existe una ruta (no terminada) para esa patente y fecha,
+// se agrega el pedido; si no, se crea la ruta. Se parte solo con César (SCPC29).
+const RUTAS_AUTO = {
+  "césar ortiz": "SCPC29",
+};
+
+function vehiculoAuto(creadoPor) {
+  const k = String(creadoPor || "").trim().toLowerCase();
+  return RUTAS_AUTO[k] || null;
+}
+
+// Fecha de la ruta en formato dd-mm-yyyy (zona Chile), según la fecha de entrega del pedido.
+function fechaRutaDT(pedido) {
+  const base = pedido.fecha_min_entrega ? new Date(pedido.fecha_min_entrega) : new Date();
+  const p = new Intl.DateTimeFormat("es-CL", {
+    timeZone: "America/Santiago", day: "2-digit", month: "2-digit", year: "numeric",
+  }).formatToParts(base);
+  const v = (t) => p.find((x) => x.type === t)?.value;
+  return `${v("day")}-${v("month")}-${v("year")}`;
+}
+
+function listaRutas(data) {
+  const r = data?.response?.routes ?? data?.routes ?? data?.response ?? [];
+  return Array.isArray(r) ? r : [];
+}
+
+async function asignarRutaAuto(pedido) {
+  const truck = vehiculoAuto(pedido.creado_por);
+  if (!truck) return { omitida: true, motivo: "chofer sin ruta automática" };
+  const fecha = fechaRutaDT(pedido);
+  const identifier = pedido.numero_guia;
+
+  // ¿Ya hay ruta de ese vehículo para ese día, no terminada?
+  const lr = await axios.get(`${DT_API_URL}/routes`, { headers: dtHeaders(), params: { date: fecha } });
+  const ruta = listaRutas(lr.data).find((x) => {
+    const pat = x.truck_identifier || x.truck?.identifier;
+    return String(pat || "").toUpperCase() === truck && !x.ended_at && !x.ended;
+  });
+
+  let routeId, accion;
+  if (ruta) {
+    routeId = ruta.id;
+    // Se envían los despachos que ya tenía + el nuevo, para no perder ninguno.
+    const existentes = (Array.isArray(ruta.dispatches) ? ruta.dispatches : [])
+      .map((d) => d.identifier).filter(Boolean);
+    const ids = [...new Set([...existentes.map(String), String(identifier)])];
+    await axios.put(`${DT_API_URL}/routes/${routeId}`,
+      { dispatches: ids.map((id) => ({ identifier: id })) }, { headers: dtHeaders() });
+    accion = "agregado a ruta existente";
+  } else {
+    const cr = await axios.post(`${DT_API_URL}/routes`,
+      { truck_identifier: truck, date: fecha, dispatches: [{ identifier }] }, { headers: dtHeaders() });
+    const d = cr.data || {};
+    routeId = d?.response?.route_id ?? d?.response?.id ?? d?.response?.route?.id ?? d?.route_id ?? d?.id ?? null;
+    accion = "ruta creada";
+  }
+
+  if (supabase && routeId) {
+    const { error } = await supabase.from("pedidos")
+      .update({ dt_route_id: String(routeId) }).eq("numero_guia", identifier);
+    if (error) console.error("No se pudo guardar dt_route_id:", error.message);
+  }
+  console.log(`🚚 Ruta automática ${truck} ${fecha}: ${identifier} -> ${accion} (${routeId})`);
+  return { truck, fecha, route_id: routeId, accion };
+}
+
+// Reintento manual: POST /api/rutas/auto { numero_guia } (para pedidos ya creados).
+app.post("/api/rutas/auto", checkPuenteToken, checkDispatchTrack, async (req, res) => {
+  const guia = req.body?.numero_guia;
+  if (!guia || !supabase) return res.status(400).json({ error: "Falta numero_guia." });
+  const { data: pedido, error } = await supabase.from("pedidos")
+    .select("numero_guia, creado_por, fecha_min_entrega").eq("numero_guia", guia).single();
+  if (error || !pedido) return res.status(404).json({ error: "Pedido no encontrado." });
+  try {
+    return res.json({ ok: true, ruta: await asignarRutaAuto(pedido) });
+  } catch (e) {
+    return res.status(502).json({ error: "DispatchTrack rechazó la ruta.", detalle: e?.response?.data || e.message });
+  }
+});
+
 // ── POST /api/dispatches — crear despacho en DispatchTrack ──
 // El formulario llama aquí al confirmar. Body: { pedido: {...}, items: [...] }
 // El puente enriquece con cliente + domicilio desde Supabase y arma el
@@ -108,9 +190,21 @@ app.post("/api/dispatches", checkPuenteToken, checkDispatchTrack, async (req, re
       : "";
     const lineas = Array.isArray(items) ? items : [];
 
+    // Nombre de contacto: la etiqueta del domicilio suele traer el detalle que el
+    // chofer necesita ("Rosangela Zapata (Condominio Los Arrecifes - Casa 53)").
+    // Si la etiqueta parte con el nombre del cliente y es más completa, se usa ella.
+    const nombreCliente = (cliente?.nombre || "").trim();
+    const etiqueta = (domicilio?.etiqueta || "").trim();
+    const primerNombre = nombreCliente.split(/\s+/)[0]?.toLowerCase() || "";
+    const contactName =
+      etiqueta && (!nombreCliente ||
+        (primerNombre && etiqueta.toLowerCase().startsWith(primerNombre) && etiqueta.length > nombreCliente.length))
+        ? etiqueta
+        : (nombreCliente || etiqueta);
+
     const payload = {
       identifier: pedido.numero_guia, // obligatorio (tu AQ-)
-      contact_name: cliente ? cliente.nombre : (domicilio?.etiqueta || ""),
+      contact_name: contactName,
       contact_address: direccion,
       contact_phone: cliente?.telefono || "",
       contact_id: domicilio?.identificador_dt || "",          // enlaza el histórico del contacto en DispatchTrack (215-1)
@@ -143,7 +237,18 @@ app.post("/api/dispatches", checkPuenteToken, checkDispatchTrack, async (req, re
 
     // 3) Crear en DispatchTrack.
     const r = await axios.post(`${DT_API_URL}/dispatches`, payload, { headers: dtHeaders() });
-    return res.json({ ok: true, dispatchtrack: r.data });
+
+    // 4) Ruta automática del día (si el pedido está asignado a un chofer con ruta automática).
+    //    Si falla, el despacho ya quedó creado: se informa, pero no se rompe el pedido.
+    let ruta = null;
+    try {
+      ruta = await asignarRutaAuto(pedido);
+    } catch (e) {
+      const det = e?.response?.data || e.message;
+      console.error("Ruta automática falló:", JSON.stringify(det));
+      ruta = { error: "No se pudo asignar la ruta automática", detalle: det };
+    }
+    return res.json({ ok: true, dispatchtrack: r.data, ruta });
   } catch (err) {
     const detalle = err?.response?.data || err.message;
     console.error("Error creando dispatch:", JSON.stringify(detalle));
